@@ -148,17 +148,31 @@ def to_xlsx_stream(file):
 def clean_columns(df):
     if df is None: return None
     new_cols, seen = [], {}
-    for col in df.columns:
-        name = " - ".join([str(p).strip() for p in col if p and "Unnamed" not in str(p)]) if isinstance(col, tuple) else str(col)
-        name = name if "Unnamed" not in name else ""
-        if name:
-            if name in seen:
-                seen[name] += 1
-                new_cols.append(f"{name}_{seen[name]}")
-            else:
-                seen[name] = 0
-                new_cols.append(name)
-    df = df.iloc[:, :len(new_cols)]
+    
+    for i, col in enumerate(df.columns):
+        # 提取非 Unnamed 的部分
+        parts = []
+        if isinstance(col, tuple):
+            parts = [str(p).strip() for p in col if p and "Unnamed" not in str(p)]
+        else:
+            p = str(col).strip()
+            if p and "Unnamed" not in p:
+                parts = [p]
+        
+        # 组合名称，如果为空则设为 未命名
+        name = " - ".join(parts) if parts else f"未命名_{i}"
+        
+        # 处理重名
+        if name in seen:
+            seen[name] += 1
+            final_name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+            final_name = name
+            
+        new_cols.append(final_name)
+    
+    # 确保列数一致，不再截断，直接赋值
     df.columns = new_cols
     return df
 
@@ -170,11 +184,25 @@ def load_excel(file, start_row, row_count):
         return clean_columns(df)
     except: return None
 
+def get_headers_only(file, start_row, row_count):
+    try:
+        file.seek(0)
+        curr = to_xlsx_stream(file) if file.name.lower().endswith('.xls') else file
+        # 只读取 0 行数据，仅获取表头结构
+        df = pd.read_excel(curr, header=list(range(start_row, start_row + row_count)), nrows=0, engine='openpyxl')
+        return clean_columns(df).columns.tolist()
+    except: return []
+
 def find_col_index(target, header_list):
     if not target: return -1
-    clean_t = target.split(' - ')[-1].split('_')[0].replace('*', '').strip()
-    for i, h in enumerate(header_list):
-        if h and clean_t in str(h).replace('*', '').strip(): return i + 1
+    try:
+        # 直接匹配扁平化后的全名 (UI 看到什么，这里就匹配什么)
+        return header_list.index(target) + 1
+    except:
+        # 如果全名没匹配上，尝试兼容性匹配 (去掉重名后缀)
+        clean_t = target.rsplit('_', 1)[0] if '_' in target else target
+        for i, h in enumerate(header_list):
+            if h and clean_t in str(h): return i + 1
     return -1
 
 def queue_download_js(results):
@@ -279,6 +307,7 @@ with tab1:
 
             if st.button("🚀 开始批量处理", use_container_width=True):
                 temp_results = []
+                error_logs = []  # 新增：记录错误信息
                 prog = st.progress(0)
                 for i, fb in enumerate(fs_b):
                     try:
@@ -290,18 +319,35 @@ with tab1:
                         stream = to_xlsx_stream(fb) if fb.name.lower().endswith('.xls') else fb
                         wb = openpyxl.load_workbook(stream)
                         ws = wb.active
-                        h_row = conf['hbs'] + conf['hbc']
-                        headers = [str(cell.value).strip() if cell.value else "" for cell in ws[h_row]]
+                        
+                        # 获取扁平化后的表头列表，确保与 UI 看到的名称完全一致
+                        headers = get_headers_only(fb, conf['hbs'], conf['hbc'])
                         ik, it = find_col_index(conf['bk'], headers), find_col_index(conf['bt'], headers)
+                        
                         if ik != -1 and it != -1:
+                            h_row = conf['hbs'] + conf['hbc']
                             for r in range(h_row + 1, ws.max_row + 1):
                                 kv = str(ws.cell(r, ik).value or "").strip()
                                 if kv in mapping: ws.cell(r, it).value = mapping[kv]
-                        out = BytesIO(); wb.save(out)
-                        temp_results.append((fb.name.rsplit('.', 1)[0] + ".xlsx", out.getvalue()))
-                    except: pass
+                            out = BytesIO(); wb.save(out)
+                            temp_results.append((fb.name.rsplit('.', 1)[0] + ".xlsx", out.getvalue()))
+                        else:
+                            # 记录未匹配到列的错误
+                            missing = []
+                            if ik == -1: missing.append(f"匹配列 '{conf['bk']}'")
+                            if it == -1: missing.append(f"更新列 '{conf['bt']}'")
+                            error_logs.append(f"❌ {fb.name}: 未找到 {' 和 '.join(missing)}")
+                    except Exception as e:
+                        error_logs.append(f"⚠️ {fb.name}: 处理出错 - {str(e)}")
                     prog.progress((i + 1) / len(fs_b))
+                
                 st.session_state.batch_results = temp_results
+                
+                # 如果有错误，显示出来
+                if error_logs:
+                    with st.expander("🚨 处理异常报告", expanded=True):
+                        for log in error_logs:
+                            st.write(log)
 
             if st.session_state.batch_results:
                 res = st.session_state.batch_results
