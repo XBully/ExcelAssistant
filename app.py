@@ -4,6 +4,8 @@ import openpyxl
 from io import BytesIO
 import time
 import base64
+import xlrd
+from xlutils.copy import copy as xl_copy
 
 # --- 1. 页面配置与 CSS ---
 st.set_page_config(page_title="小雷Excel批量助手", page_icon="⚡", layout="wide")
@@ -150,14 +152,18 @@ def clean_columns(df):
     new_cols, seen = [], {}
     
     for i, col in enumerate(df.columns):
-        # 提取非 Unnamed 的部分
+        # 提取非 Unnamed 的部分，并清理空格
         parts = []
         if isinstance(col, tuple):
-            parts = [str(p).strip() for p in col if p and "Unnamed" not in str(p)]
+            # 处理多级表头：过滤掉空值、Unnamed、以及只含空格的字符串
+            for p in col:
+                p_str = str(p).strip()
+                if p_str and "nan" not in p_str.lower() and "unnamed" not in p_str.lower():
+                    parts.append(p_str)
         else:
-            p = str(col).strip()
-            if p and "Unnamed" not in p:
-                parts = [p]
+            p_str = str(col).strip()
+            if p_str and "nan" not in p_str.lower() and "unnamed" not in p_str.lower():
+                parts = [p_str]
         
         # 组合名称，如果为空则设为 未命名
         name = " - ".join(parts) if parts else f"未命名_{i}"
@@ -172,24 +178,30 @@ def clean_columns(df):
             
         new_cols.append(final_name)
     
-    # 确保列数一致，不再截断，直接赋值
+    # 直接赋值，不再进行列截断
     df.columns = new_cols
+    # 丢弃全是空值的行
+    df.dropna(how='all', inplace=True)
     return df
 
 def load_excel(file, start_row, row_count):
     try:
         file.seek(0)
-        curr = to_xlsx_stream(file) if file.name.lower().endswith('.xls') else file
-        df = pd.read_excel(curr, header=list(range(start_row, start_row + row_count)), engine='openpyxl')
+        if file.name.lower().endswith('.xls'):
+            df = pd.read_excel(file, header=list(range(start_row, start_row + row_count)), engine='xlrd')
+        else:
+            df = pd.read_excel(file, header=list(range(start_row, start_row + row_count)), engine='openpyxl')
         return clean_columns(df)
-    except: return None
+    except Exception as e:
+        return None
 
 def get_headers_only(file, start_row, row_count):
     try:
         file.seek(0)
-        curr = to_xlsx_stream(file) if file.name.lower().endswith('.xls') else file
-        # 只读取 0 行数据，仅获取表头结构
-        df = pd.read_excel(curr, header=list(range(start_row, start_row + row_count)), nrows=0, engine='openpyxl')
+        if file.name.lower().endswith('.xls'):
+            df = pd.read_excel(file, header=list(range(start_row, start_row + row_count)), nrows=0, engine='xlrd')
+        else:
+            df = pd.read_excel(file, header=list(range(start_row, start_row + row_count)), nrows=0, engine='openpyxl')
         return clean_columns(df).columns.tolist()
     except: return []
 
@@ -210,7 +222,10 @@ def queue_download_js(results):
     files_list = []
     for name, data in results:
         b64 = base64.b64encode(data).decode()
-        files_list.append({"name": name, "base64": b64})
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if name.lower().endswith('.xls'):
+            mime = "application/vnd.ms-excel"
+        files_list.append({"name": name, "base64": b64, "mime": mime})
     
     files_json = json.dumps(files_list)
     
@@ -220,7 +235,7 @@ def queue_download_js(results):
             const files = {files_json};
             async function download() {{
                 for (const file of files) {{
-                    const blob = await (await fetch(`data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${{file.base64}}`)).blob();
+                    const blob = await (await fetch(`data:${{file.mime}};base64,${{file.base64}}`)).blob();
                     const url = window.URL.createObjectURL(blob);
                     const link = document.createElement('a');
                     link.style.display = 'none';
@@ -315,22 +330,45 @@ with tab1:
                         conf = overrides.get(i, {'has':has,'hac':hac,'hbs':hbs,'hbc':hbc,'ak':ak,'av':av,'bk':bk,'bt':bt})
                         df_ca = load_excel(f_a, conf['has'], conf['hac'])
                         mapping = dict(zip(df_ca[conf['ak']].astype(str).str.strip(), df_ca[conf['av']]))
-                        fb.seek(0)
-                        stream = to_xlsx_stream(fb) if fb.name.lower().endswith('.xls') else fb
-                        wb = openpyxl.load_workbook(stream)
-                        ws = wb.active
                         
                         # 获取扁平化后的表头列表，确保与 UI 看到的名称完全一致
                         headers = get_headers_only(fb, conf['hbs'], conf['hbc'])
                         ik, it = find_col_index(conf['bk'], headers), find_col_index(conf['bt'], headers)
                         
                         if ik != -1 and it != -1:
-                            h_row = conf['hbs'] + conf['hbc']
-                            for r in range(h_row + 1, ws.max_row + 1):
-                                kv = str(ws.cell(r, ik).value or "").strip()
-                                if kv in mapping: ws.cell(r, it).value = mapping[kv]
-                            out = BytesIO(); wb.save(out)
-                            temp_results.append((fb.name.rsplit('.', 1)[0] + ".xlsx", out.getvalue()))
+                            fb.seek(0)
+                            file_ext = fb.name.rsplit('.', 1)[-1].lower()
+                            
+                            if file_ext == 'xls':
+                                # .xls 使用 xlrd + xlutils 以保留格式
+                                rb = xlrd.open_workbook(file_contents=fb.read(), formatting_info=True)
+                                wb = xl_copy(rb)
+                                ws = wb.get_sheet(0)
+                                sheet_read = rb.sheet_by_index(0)
+                                
+                                col_k_idx = ik - 1
+                                col_t_idx = it - 1
+                                start_row_idx = conf['hbs'] + conf['hbc']
+                                
+                                for r in range(start_row_idx, sheet_read.nrows):
+                                    cell_val = sheet_read.cell_value(r, col_k_idx)
+                                    kv = str(cell_val).strip()
+                                    if kv in mapping:
+                                        ws.write(r, col_t_idx, mapping[kv])
+                                
+                                out = BytesIO()
+                                wb.save(out)
+                                temp_results.append((fb.name, out.getvalue()))
+                            else:
+                                # .xlsx 使用 openpyxl
+                                wb = openpyxl.load_workbook(fb)
+                                ws = wb.active
+                                h_row = conf['hbs'] + conf['hbc']
+                                for r in range(h_row + 1, ws.max_row + 1):
+                                    kv = str(ws.cell(r, ik).value or "").strip()
+                                    if kv in mapping: ws.cell(r, it).value = mapping[kv]
+                                out = BytesIO(); wb.save(out)
+                                temp_results.append((fb.name.rsplit('.', 1)[0] + ".xlsx", out.getvalue()))
                         else:
                             # 记录未匹配到列的错误
                             missing = []
@@ -359,40 +397,171 @@ with tab1:
                     # --- TAB 2: 字段提取 (重写加回) ---
 with tab2:
     st.markdown('<div class="upload-card">', unsafe_allow_html=True)
-    st.markdown("##### � 批量提取数据字段")
+    st.markdown("##### 🔍 批量提取数据字段")
     fs_ex = st.file_uploader("提取文件", type=['xlsx', 'xls'], accept_multiple_files=True, label_visibility="collapsed", key="uex")
     if fs_ex:
+        st.markdown('<div class="config-card">', unsafe_allow_html=True)
+        st.markdown("##### ⚙️ 全局默认设置")
         c1, c2 = st.columns(2)
-        exs = c1.number_input("表头起行", 0, 10, 0, key="exs_t2")
-        exc = c2.number_input("表头行数", 1, 5, 1, key="exc_t2")
-    st.markdown('</div>', unsafe_allow_html=True)
+        exs_g = c1.number_input("默认表头起行", 0, 10, 0, key="exs_g")
+        exc_g = c2.number_input("默认表头行数", 1, 5, 1, key="exc_g")
+        
+        sample_df_g = load_excel(fs_ex[0], exs_g, exc_g)
+        sel_cols_g = []
+        if sample_df_g is not None:
+            sel_cols_g = st.multiselect("默认勾选字段 (将作为所有文件的初始选择)：", options=sample_df_g.columns, key="sel_cols_g")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    if fs_ex:
-        sample_df = load_excel(fs_ex[0], exs, exc)
-        if sample_df is not None:
-            st.markdown('<div class="config-card">', unsafe_allow_html=True)
-            sel_cols = st.multiselect("请勾选需要保留的字段：", options=sample_df.columns, key="sel_cols_ex")
-            st.markdown('</div>', unsafe_allow_html=True)
+        # 记录每个文件的个性化配置
+        ex_overrides = {}
+        with st.expander(f"📋 个性化提取清单 ({len(fs_ex)}份)", expanded=False):
+            for i, f in enumerate(fs_ex):
+                st.markdown(f'<div class="personal-box">', unsafe_allow_html=True)
+                st.markdown(f"📄 **{f.name}**")
+                ec1, ec2 = st.columns(2)
+                f_exs = ec1.number_input("起行", 0, 10, value=exs_g, key=f"exs_{i}")
+                f_exc = ec2.number_input("行数", 1, 5, value=exc_g, key=f"exc_{i}")
+                
+                f_df = load_excel(f, f_exs, f_exc)
+                if f_df is not None:
+                    # 默认选中在全局配置中存在的列
+                    default_sel = [c for c in sel_cols_g if c in f_df.columns]
+                    f_sel = st.multiselect("选择字段：", options=f_df.columns, default=default_sel, key=f"sel_{i}")
+                    ex_overrides[i] = {'exs': f_exs, 'exc': f_exc, 'sel': f_sel}
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            if sel_cols and st.button("🚀 执行批量提取", use_container_width=True):
-                ex_results = []
-                prog_ex = st.progress(0)
-                for i, f in enumerate(fs_ex):
-                    df = load_excel(f, exs, exc)
-                    if df is not None:
-                        # 只取存在的列
-                        valid_cols = [c for c in sel_cols if c in df.columns]
+        st.markdown('<div class="config-card">', unsafe_allow_html=True)
+        st.markdown("##### 📝 导出配置")
+        c_n1, c_n2 = st.columns([3, 1])
+        default_name_tpl = "提取名"
+        ex_name_tpl = c_n1.text_input("导出文件名 (使用 {name} 代替原文件名)", value=default_name_tpl, key="ex_name_tpl")
+        merge_all = c_n2.checkbox("合并为一个表", value=False, key="merge_ex")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if st.button("🚀 执行批量提取", use_container_width=True, key="run_ex"):
+            ex_results = []
+            all_dfs = [] 
+            ex_error_logs = [] 
+            prog_ex = st.progress(0)
+            
+            # 如果是合并模式，先确定主列列表
+            master_cols = sel_cols_g if merge_all else []
+            
+            for i, f in enumerate(fs_ex):
+                try:
+                    conf = ex_overrides.get(i, {'exs': exs_g, 'exc': exc_g, 'sel': sel_cols_g})
+                    current_sel = conf['sel']
+                    
+                    if not current_sel and not merge_all:
+                        continue
+
+                    if merge_all:
+                        df = load_excel(f, conf['exs'], conf['exc'])
+                        if df is not None and not df.empty:
+                            target_cols = current_sel if current_sel else master_cols
+                            # 建立该文件的列映射（忽略后缀匹配以增加鲁棒性）
+                            file_col_map = {}
+                            for col in df.columns:
+                                base = col.rsplit('_', 1)[0] if '_' in col else col
+                                if base not in file_col_map: file_col_map[base] = col
+                            
+                            # 按照选中的列顺序提取数据
+                            extracted_data = {}
+                            found_any = False
+                            for t_col in target_cols:
+                                if t_col in df.columns:
+                                    extracted_data[t_col] = df[t_col]
+                                    found_any = True
+                                else:
+                                    # 尝试忽略后缀匹配
+                                    t_base = t_col.rsplit('_', 1)[0] if '_' in t_col else t_col
+                                    if t_base in file_col_map:
+                                        extracted_data[t_col] = df[file_col_map[t_base]]
+                                        found_any = True
+                                    else:
+                                        extracted_data[t_col] = pd.Series([None] * len(df))
+                            
+                            if found_any:
+                                # 【核心修复】：将提取的数据转换为标准的 DataFrame
+                                # 使用字典构造，并明确指定每一列的数据内容
+                                df_to_append = pd.DataFrame()
+                                for t_col in target_cols:
+                                    # 如果该列没匹配到，填充等长的空值
+                                    data = extracted_data.get(t_col)
+                                    if data is None:
+                                        data = [None] * len(df)
+                                    df_to_append[t_col] = data
+                                
+                                # 重置索引并加入列表
+                                df_to_append.reset_index(drop=True, inplace=True)
+                                all_dfs.append(df_to_append)
+                                ex_error_logs.append(f"✅ {f.name}: 提取并对齐了 {len(df_to_append)} 行数据")
+                            else:
+                                ex_error_logs.append(f"⚠️ {f.name}: 未匹配到任何选中的列")
+                        else:
+                            ex_error_logs.append(f"❌ {f.name}: 读取失败或为空")
+                    else:
+                        # 非合并模式：使用 openpyxl 保持原样逻辑
+                        f.seek(0)
+                        if f.name.lower().endswith('.xls'):
+                            stream = to_xlsx_stream(f)
+                        else:
+                            stream = f
+                        
+                        if stream is None:
+                            ex_error_logs.append(f"❌ {f.name}: .xls 转换失败")
+                            continue
+                            
+                        wb = openpyxl.load_workbook(stream)
+                        ws = wb.active
+                        file_headers = get_headers_only(f, conf['exs'], conf['exc'])
+                        
+                        cols_to_delete = []
+                        for idx, h in enumerate(file_headers):
+                            if h not in current_sel:
+                                cols_to_delete.append(idx + 1)
+                        
+                        if len(cols_to_delete) == len(file_headers):
+                            ex_error_logs.append(f"⚠️ {f.name}: 未选中任何有效列")
+                            continue
+
+                        for col_idx in sorted(cols_to_delete, reverse=True):
+                            ws.delete_cols(col_idx)
+                        
                         out = BytesIO()
-                        df[valid_cols].to_excel(out, index=False)
-                        ex_results.append((f"提取_{f.name.rsplit('.', 1)[0]}.xlsx", out.getvalue()))
-                    prog_ex.progress((i + 1) / len(fs_ex))
-                st.session_state.extract_results = ex_results
+                        wb.save(out)
+                        orig_name = f.name.rsplit('.', 1)[0]
+                        new_name_base = ex_name_tpl.replace("{name}", orig_name) if "{name}" in ex_name_tpl else (f"{ex_name_tpl}_{i+1}" if len(fs_ex) > 1 else ex_name_tpl)
+                        ex_results.append((f"{new_name_base}.xlsx", out.getvalue()))
+                        ex_error_logs.append(f"✅ {f.name}: 已提取并保留格式")
+                except Exception as e:
+                    ex_error_logs.append(f"⚠️ {f.name}: 处理出错 - {str(e)}")
+                prog_ex.progress((i + 1) / len(fs_ex))
+            
+            if merge_all and all_dfs:
+                # 智能合并：对齐列并忽略索引
+                merged_df = pd.concat(all_dfs, ignore_index=True)
+                out = BytesIO()
+                with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                    merged_df.to_excel(writer, index=False)
+                ex_results = [(f"{ex_name_tpl}.xlsx", out.getvalue())]
+                st.success(f"📊 汇总完成：共计 {len(merged_df)} 行数据")
+            
+            st.session_state.extract_results = ex_results
+
+            # 显示错误报告
+            if ex_error_logs:
+                with st.expander("🚨 提取异常报告", expanded=True):
+                    for log in ex_error_logs:
+                        st.write(log)
 
             if st.session_state.extract_results:
                 e_res = st.session_state.extract_results
                 st.markdown(f'<div class="download-bar"><span>✅ 提取完成 ({len(e_res)}个)</span></div>', unsafe_allow_html=True)
                 if st.button(f"📥 顺序自动下载 {len(e_res)} 个提取文件", use_container_width=True, type="primary", key="dl_ex_btn"):
+                    # 使用当前时间戳作为 key 强制刷新 HTML 组件以触发 JS 执行
                     st.components.v1.html(queue_download_js(e_res), height=0)
+                    st.toast("正在启动队列下载，请允许浏览器下载多个文件...", icon="⌛")
                 
                 with st.expander("📄 查看提取文件明细"):
                     for idx, (n, d) in enumerate(e_res):
