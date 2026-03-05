@@ -1,225 +1,364 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
-import os
 from io import BytesIO
+import time
+import base64
 
-# --- 页面配置 ---
-st.set_page_config(
-    page_title="小雷同学的Excel处理小助手",
-    page_icon="💗",
-    layout="wide"
-)
+# --- 1. 页面配置与 CSS ---
+st.set_page_config(page_title="小雷Excel批量助手", page_icon="⚡", layout="wide")
 
-# ======================================================
-# 通用函数：读取 Excel（兼容 xls / xlsx）
-# ======================================================
-def load_excel(uploaded_file, header_rows):
+st.markdown("""
+    <style>
+    /* 全局背景与字体 */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+    
+    .main {
+        background-color: #fcfdfe;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    
+    .block-container { 
+        padding-top: 2rem !important; 
+        max-width: 1000px !important;
+    }
+    
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+
+    /* 标题样式 */
+    .main-title {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1e293b;
+        margin-bottom: 0.5rem;
+        text-align: center;
+        background: linear-gradient(90deg, #3b82f6, #06b6d4);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .sub-title {
+        font-size: 0.9rem;
+        color: #64748b;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+
+    /* 卡片通用样式 */
+    .stFileUploader section {
+        border: 2px dashed #e2e8f0 !important;
+        background-color: #ffffff !important;
+        padding: 1.5rem !important;
+        border-radius: 12px !important;
+        transition: all 0.3s ease;
+    }
+    .stFileUploader section:hover {
+        border-color: #3b82f6 !important;
+        background-color: #f8fafc !important;
+    }
+
+    .upload-card {
+        background: #ffffff;
+        border: 1px solid #f1f5f9;
+        padding: 20px;
+        border-radius: 16px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+        margin-bottom: 20px;
+    }
+
+    .config-card {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        padding: 18px;
+        border-radius: 12px;
+        margin-bottom: 15px;
+    }
+
+    .personal-box {
+        padding: 15px;
+        background: #ffffff;
+        border-radius: 12px;
+        margin-top: 10px;
+        border: 1px solid #f1f5f9;
+        box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.02);
+        border-left: 4px solid #3b82f6;
+    }
+
+    .download-bar {
+        background: #ecfdf5;
+        border: 1px solid #10b981;
+        padding: 15px 20px;
+        border-radius: 12px;
+        margin: 20px 0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        color: #065f46;
+        font-weight: 500;
+    }
+
+    /* 按钮美化 */
+    .stButton > button {
+        border-radius: 10px !important;
+        padding: 0.5rem 1rem !important;
+        font-weight: 600 !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.25);
+    }
+    
+    /* 侧边栏/输入框样式 */
+    h5 {
+        margin-bottom: 0.8rem !important;
+        font-weight: 600 !important;
+        font-size: 0.95rem !important;
+        color: #1e293b !important;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    
+    .stExpander {
+        border-radius: 12px !important;
+        border: 1px solid #f1f5f9 !important;
+        background: #ffffff !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+if 'batch_results' not in st.session_state:
+    st.session_state.batch_results = []
+if 'extract_results' not in st.session_state:
+    st.session_state.extract_results = []
+
+# --- 2. 辅助函数 ---
+def to_xlsx_stream(file):
     try:
-        engine = 'xlrd' if uploaded_file.name.endswith('.xls') else 'openpyxl'
-        return pd.read_excel(uploaded_file, header=header_rows, engine=engine)
-    except Exception as e:
-        st.error(f"读取失败: {e}")
-        return None
+        file.seek(0)
+        df = pd.read_excel(file, header=None, engine='xlrd')
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, header=False)
+        output.seek(0)
+        return output
+    except: return None
 
-
-# ======================================================
-# 侧边栏
-# ======================================================
-with st.sidebar:
-    st.title("🚀 功能选择")
-    mode = st.radio(
-        "请选择操作：",
-        ["🔄 关联更新 (两表匹配)", "✨ 自定义提取 (单表筛选)"]
-    )
-    st.divider()
-    st.caption("Excel 全能助手 v1.0")
-    st.caption("支持多行表头 + xls / xlsx")
-
-
-# ======================================================
-# 模式一：关联更新
-# ======================================================
-if mode == "🔄 关联更新 (两表匹配)":
-
-    st.header("🔄 关联更新 (VLOOKUP 模式)")
-    st.info("根据 A 表数据更新 B 表指定列，保持 B 表原始格式")
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.subheader("1️⃣ 上传 A 表")
-        file_a = st.file_uploader("上传 A 表", type=['xlsx', 'xls'], key="update_a")
-        h_a = st.number_input("A 表表头行", min_value=0, value=0)
-
-    with col_b:
-        st.subheader("2️⃣ 上传 B 表")
-        file_b = st.file_uploader("上传 B 表", type=['xlsx', 'xls'], key="update_b")
-        h_b = st.number_input("B 表表头行", min_value=0, value=0)
-
-    if file_a and file_b:
-        df_a = load_excel(file_a, h_a)
-        df_b_preview = load_excel(file_b, h_b)
-
-        if df_a is not None and df_b_preview is not None:
-
-            st.divider()
-            c1, c2, c3 = st.columns(3)
-
-            with c1:
-                a_key = st.selectbox("A表：匹配列", df_a.columns)
-                a_val = st.selectbox("A表：取值列", df_a.columns)
-
-            with c2:
-                b_key = st.selectbox("B表：匹配列", df_b_preview.columns)
-                b_target = st.selectbox("B表：目标更新列", df_b_preview.columns)
-
-            with c3:
-                default_out_name = os.path.splitext(file_b.name)[0]
-                out_name = st.text_input("导出文件名:", value=default_out_name)
-
-            if st.button("🚀 执行关联更新"):
-                try:
-                    mapping = dict(
-                        zip(
-                            df_a[a_key].astype(str).str.strip(),
-                            df_a[a_val]
-                        )
-                    )
-
-                    file_b.seek(0)
-
-                    if file_b.name.endswith('.xls'):
-                        df_full = pd.read_excel(file_b, header=None, engine='xlrd')
-                        temp_io = BytesIO()
-                        df_full.to_excel(temp_io, index=False, header=False, engine='openpyxl')
-                        temp_io.seek(0)
-                        wb = openpyxl.load_workbook(temp_io)
-                    else:
-                        wb = openpyxl.load_workbook(file_b)
-
-                    ws = wb.active
-                    headers = [str(cell.value) for cell in ws[h_b + 1]]
-
-                    idx_id = headers.index(str(b_key)) + 1
-                    idx_target = headers.index(str(b_target)) + 1
-
-                    for r in range(h_b + 2, ws.max_row + 1):
-                        raw_id = ws.cell(row=r, column=idx_id).value
-                        clean_id = str(raw_id).strip() if raw_id else ""
-                        if clean_id in mapping:
-                            ws.cell(row=r, column=idx_target).value = mapping[clean_id]
-
-                    out_io = BytesIO()
-                    wb.save(out_io)
-
-                    st.success("✅ 更新成功！")
-                    st.download_button(
-                        f"📥 下载 {out_name}.xlsx",
-                        out_io.getvalue(),
-                        f"{out_name}.xlsx"
-                    )
-
-                except Exception as e:
-                    st.error(f"错误: {e}")
-
-
-# ======================================================
-# 模式二：自定义提取（支持多行表头）
-# ======================================================
-elif mode == "✨ 自定义提取 (单表筛选)":
-
-    st.header("✨ 自定义提取 (支持跨行表头)")
-    st.info("支持 1~N 行表头，自动合并为可勾选字段")
-
-    file_extract = st.file_uploader(
-        "上传原始 Excel 文件",
-        type=['xlsx', 'xls'],
-        key="extract_file"
-    )
-
-    if file_extract:
-
-        h_ex = st.number_input("表头起始行(从0开始)", min_value=0, value=0)
-        header_count = st.number_input("表头行数", min_value=1, value=1)
-
-        try:
-            engine = 'xlrd' if file_extract.name.endswith('.xls') else 'openpyxl'
-
-            df_ex = pd.read_excel(
-                file_extract,
-                header=list(range(h_ex, h_ex + header_count)),
-                engine=engine
-            )
-
-            # ---------- 多级表头处理 ----------
-            # original_columns = df_ex.columns  # 备份原始表头结构 (已移除恢复逻辑，暂不需要)
-            flat_columns = []
-
-            if isinstance(df_ex.columns, pd.MultiIndex):
-                for col in df_ex.columns:
-                    col_parts = [str(i) for i in col if str(i) != "nan" and "Unnamed" not in str(i)]
-                    flat_columns.append(" - ".join(col_parts))
+def clean_columns(df):
+    if df is None: return None
+    new_cols, seen = [], {}
+    for col in df.columns:
+        name = " - ".join([str(p).strip() for p in col if p and "Unnamed" not in str(p)]) if isinstance(col, tuple) else str(col)
+        name = name if "Unnamed" not in name else ""
+        if name:
+            if name in seen:
+                seen[name] += 1
+                new_cols.append(f"{name}_{seen[name]}")
             else:
-                flat_columns = df_ex.columns.astype(str).tolist()
-            
-            # --- 表头去重处理 ---
-            # Streamlit/PyArrow 不支持重复列名，需进行重命名处理
-            deduped_columns = []
-            seen = {}
-            for col in flat_columns:
-                if col in seen:
-                    seen[col] += 1
-                    new_col = f"{col}_{seen[col]}"
-                    deduped_columns.append(new_col)
-                else:
-                    seen[col] = 0
-                    deduped_columns.append(col)
-            flat_columns = deduped_columns
-            
-            # 创建映射关系 (如果后续需要恢复原始表头可启用，目前仅用于扁平化导出)
-            # col_mapping = dict(zip(flat_columns, original_columns))
-            
-            # 更新 DataFrame 列名为扁平化名称以供显示和选择
-            df_ex.columns = flat_columns
+                seen[name] = 0
+                new_cols.append(name)
+    df = df.iloc[:, :len(new_cols)]
+    df.columns = new_cols
+    return df
 
-            st.success("✅ 表头识别成功")
-            st.dataframe(df_ex.head())
+def load_excel(file, start_row, row_count):
+    try:
+        file.seek(0)
+        curr = to_xlsx_stream(file) if file.name.lower().endswith('.xls') else file
+        df = pd.read_excel(curr, header=list(range(start_row, start_row + row_count)), engine='openpyxl')
+        return clean_columns(df)
+    except: return None
 
-            st.subheader("字段选择")
+def find_col_index(target, header_list):
+    if not target: return -1
+    clean_t = target.split(' - ')[-1].split('_')[0].replace('*', '').strip()
+    for i, h in enumerate(header_list):
+        if h and clean_t in str(h).replace('*', '').strip(): return i + 1
+    return -1
 
-            selected_cols = st.multiselect(
-                "请选择需要保留的字段：",
-                options=flat_columns
-            )
+def queue_download_js(results):
+    import json
+    files_list = []
+    for name, data in results:
+        b64 = base64.b64encode(data).decode()
+        files_list.append({"name": name, "base64": b64})
+    
+    files_json = json.dumps(files_list)
+    
+    js_code = f"""
+        <script>
+        (function() {{
+            const files = {files_json};
+            async function download() {{
+                for (const file of files) {{
+                    const blob = await (await fetch(`data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${{file.base64}}`)).blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.style.display = 'none';
+                    link.href = url;
+                    link.download = file.name;
+                    document.body.appendChild(link);
+                    link.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(link);
+                    await new Promise(r => setTimeout(r, 800));
+                }}
+            }}
+            download();
+        }})();
+        </script>
+    """
+    return js_code
 
-            default_ex_name = os.path.splitext(file_extract.name)[0] + "_提取"
-            ex_out_name = st.text_input("导出文件名:", value=default_ex_name)
+# --- 3. 界面交互 ---
+st.markdown('<div class="main-title">⚡ 小雷 Excel 批量助手</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">高效、简单、本地处理的 Excel 办公利器</div>', unsafe_allow_html=True)
 
-            if selected_cols:
-                if st.button("🚀 生成并导出新表"):
-                    new_df = df_ex[selected_cols].copy()
-                    
-                    # 简化逻辑：直接导出扁平化后的单行表头
-                    out_ex_io = BytesIO()
-                    with pd.ExcelWriter(out_ex_io, engine='openpyxl') as writer:
-                        new_df.to_excel(writer, index=False)
+tab1, tab2 = st.tabs(["🔄 批量关联更新", "✨ 批量字段提取"])
 
-                    st.balloons()
-                    st.download_button(
-                        f"📥 下载 {ex_out_name}.xlsx",
-                        out_ex_io.getvalue(),
-                        f"{ex_out_name}.xlsx"
-                    )
-            else:
-                st.warning("请至少选择一个字段")
+with tab1:
+    st.markdown('<div class="upload-card">', unsafe_allow_html=True)
+    up_c1, up_c2 = st.columns([1.2, 2])
+    with up_c1:
+        st.markdown("##### � A表 (来源数据)")
+        f_a = st.file_uploader("A", type=['xlsx', 'xls'], label_visibility="collapsed", key="ua")
+        c_as, c_ac = st.columns(2)
+        has = c_as.number_input("起行", 0, 20, 0, key="has_global")
+        hac = c_ac.number_input("行数", 1, 5, 1, key="hac_global")
+    with up_c2:
+        st.markdown("##### � B表 (目标多选)")
+        fs_b = st.file_uploader("B", type=['xlsx', 'xls'], accept_multiple_files=True, label_visibility="collapsed", key="ubs")
+        c_bs, c_bc = st.columns(2)
+        hbs = c_bs.number_input("起行", 0, 20, 0, key="hbs_global")
+        hbc = c_bc.number_input("行数", 1, 5, 1, key="hbc_global")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-        except Exception as e:
-            st.error(f"读取失败: {e}")
+    if f_a and fs_b:
+        df_a_g = load_excel(f_a, has, hac)
+        df_b_g = load_excel(fs_b[0], hbs, hbc)
 
+        if df_a_g is not None and df_b_g is not None:
+            st.markdown('<div class="config-card">', unsafe_allow_html=True)
+            st.caption("⚙️ 全局默认配置 (修改后将同步至下方个性化默认值)")
+            cols = st.columns(4)
+            ak = cols[0].selectbox("A匹配列", df_a_g.columns, key="gak")
+            av = cols[1].selectbox("A取值列", df_a_g.columns, key="gav")
+            bk = cols[2].selectbox("B匹配列", df_b_g.columns, key="gbk")
+            bt = cols[3].selectbox("B更新列", df_b_g.columns, key="gbt")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-# ======================================================
-# 底部
-# ======================================================
-st.divider()
-st.caption("💡 所有操作在本地执行。复杂 .xls 文件建议先转为 .xlsx 再使用。")
+            overrides = {}
+            with st.expander(f"🔍 个性化清单 ({len(fs_b)}份)"):
+                for i, fb in enumerate(fs_b):
+                    oc1, oc2 = st.columns([5, 1])
+                    oc1.caption(f"📄 {fb.name}")
+                    # 只要勾选了个性化，才记录 override
+                    if oc2.checkbox("个性化", key=f"is_p_{i}"):
+                        st.markdown('<div class="personal-box">', unsafe_allow_html=True)
+                        r1, r2, r3, r4 = st.columns(4)
+                        # 【核心修复】：value 直接绑定全局变量 has/hac/hbs/hbc
+                        p_as = r1.number_input("A起", 0, 20, value=has, key=f"pas_{i}")
+                        p_ac = r2.number_input("A行", 1, 5, value=hac, key=f"pac_{i}")
+                        p_bs = r3.number_input("B起", 0, 20, value=hbs, key=f"pbs_{i}")
+                        p_bc = r4.number_input("B行", 1, 5, value=hbc, key=f"pbc_{i}")
+                        
+                        df_al, df_bl = load_excel(f_a, p_as, p_ac), load_excel(fb, p_bs, p_bc)
+                        if df_al is not None and df_bl is not None:
+                            def get_safe_idx(options, target):
+                                try: return list(options).index(target)
+                                except: return 0
+                            l1, l2, l3, l4 = st.columns(4)
+                            # 【核心修复】：index 动态根据全局选中的列名计算
+                            p_ak = l1.selectbox("A匹", df_al.columns, index=get_safe_idx(df_al.columns, ak), key=f"pak_{i}")
+                            p_av = l2.selectbox("A取", df_al.columns, index=get_safe_idx(df_al.columns, av), key=f"pav_{i}")
+                            p_bk = l3.selectbox("B匹", df_bl.columns, index=get_safe_idx(df_bl.columns, bk), key=f"pbk_{i}")
+                            p_bt = l4.selectbox("B更", df_bl.columns, index=get_safe_idx(df_bl.columns, bt), key=f"pbt_{i}")
+                            overrides[i] = {'has':p_as,'hac':p_ac,'hbs':p_bs,'hbc':p_bc,'ak':p_ak,'av':p_av,'bk':p_bk,'bt':p_bt}
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+            if st.button("🚀 开始批量处理", use_container_width=True):
+                temp_results = []
+                prog = st.progress(0)
+                for i, fb in enumerate(fs_b):
+                    try:
+                        # 逻辑：有个性化配置用个性化，没有用全局
+                        conf = overrides.get(i, {'has':has,'hac':hac,'hbs':hbs,'hbc':hbc,'ak':ak,'av':av,'bk':bk,'bt':bt})
+                        df_ca = load_excel(f_a, conf['has'], conf['hac'])
+                        mapping = dict(zip(df_ca[conf['ak']].astype(str).str.strip(), df_ca[conf['av']]))
+                        fb.seek(0)
+                        stream = to_xlsx_stream(fb) if fb.name.lower().endswith('.xls') else fb
+                        wb = openpyxl.load_workbook(stream)
+                        ws = wb.active
+                        h_row = conf['hbs'] + conf['hbc']
+                        headers = [str(cell.value).strip() if cell.value else "" for cell in ws[h_row]]
+                        ik, it = find_col_index(conf['bk'], headers), find_col_index(conf['bt'], headers)
+                        if ik != -1 and it != -1:
+                            for r in range(h_row + 1, ws.max_row + 1):
+                                kv = str(ws.cell(r, ik).value or "").strip()
+                                if kv in mapping: ws.cell(r, it).value = mapping[kv]
+                        out = BytesIO(); wb.save(out)
+                        temp_results.append((fb.name.rsplit('.', 1)[0] + ".xlsx", out.getvalue()))
+                    except: pass
+                    prog.progress((i + 1) / len(fs_b))
+                st.session_state.batch_results = temp_results
+
+            if st.session_state.batch_results:
+                res = st.session_state.batch_results
+                st.markdown(f'<div class="download-bar"><span>✅ 处理完成 ({len(res)}个)</span></div>', unsafe_allow_html=True)
+                if st.button(f"📥 按顺序自动下载全部 {len(res)} 个文件", use_container_width=True, type="primary"):
+                    # 使用 key 强制刷新组件以触发 JS
+                    st.components.v1.html(queue_download_js(res), height=0)
+                    st.toast("正在启动队列下载，请允许浏览器下载多个文件...", icon="⌛")
+                    # --- TAB 2: 字段提取 (重写加回) ---
+with tab2:
+    st.markdown('<div class="upload-card">', unsafe_allow_html=True)
+    st.markdown("##### � 批量提取数据字段")
+    fs_ex = st.file_uploader("提取文件", type=['xlsx', 'xls'], accept_multiple_files=True, label_visibility="collapsed", key="uex")
+    if fs_ex:
+        c1, c2 = st.columns(2)
+        exs = c1.number_input("表头起行", 0, 10, 0, key="exs_t2")
+        exc = c2.number_input("表头行数", 1, 5, 1, key="exc_t2")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if fs_ex:
+        sample_df = load_excel(fs_ex[0], exs, exc)
+        if sample_df is not None:
+            st.markdown('<div class="config-card">', unsafe_allow_html=True)
+            sel_cols = st.multiselect("请勾选需要保留的字段：", options=sample_df.columns, key="sel_cols_ex")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            if sel_cols and st.button("🚀 执行批量提取", use_container_width=True):
+                ex_results = []
+                prog_ex = st.progress(0)
+                for i, f in enumerate(fs_ex):
+                    df = load_excel(f, exs, exc)
+                    if df is not None:
+                        # 只取存在的列
+                        valid_cols = [c for c in sel_cols if c in df.columns]
+                        out = BytesIO()
+                        df[valid_cols].to_excel(out, index=False)
+                        ex_results.append((f"提取_{f.name.rsplit('.', 1)[0]}.xlsx", out.getvalue()))
+                    prog_ex.progress((i + 1) / len(fs_ex))
+                st.session_state.extract_results = ex_results
+
+            if st.session_state.extract_results:
+                e_res = st.session_state.extract_results
+                st.markdown(f'<div class="download-bar"><span>✅ 提取完成 ({len(e_res)}个)</span></div>', unsafe_allow_html=True)
+                if st.button(f"📥 顺序自动下载 {len(e_res)} 个提取文件", use_container_width=True, type="primary", key="dl_ex_btn"):
+                    st.components.v1.html(queue_download_js(e_res), height=0)
+                
+                with st.expander("📄 查看提取文件明细"):
+                    for idx, (n, d) in enumerate(e_res):
+                        cl1, cl2 = st.columns([4, 1])
+                        cl1.markdown(f"📄 {n}")
+                        cl2.download_button("下载", d, n, key=f"ex_dl_{idx}")
+
+# --- 4. 底部声明 ---
+st.markdown("---")
+st.markdown(
+    '<div style="text-align: center; color: #94a3b8; font-size: 0.8rem; padding: 20px;">'
+    '小雷 Excel 助手 · 本地处理更安全 · 2024'
+    '</div>', 
+    unsafe_allow_html=True
+)
